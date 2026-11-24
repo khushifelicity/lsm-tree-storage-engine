@@ -8,8 +8,8 @@ A from-scratch LSM-Tree key-value storage engine in pure Python 3 (standard libr
 |---|---|
 | Memtable (put / get / delete, tombstones) | Done |
 | Write-ahead log with crash replay | Done |
-| SSTable flush, manifest, multi-file reads | Planned (Step B) |
-| Startup cleanup, lock file | Planned (Step B) |
+| SSTable flush, manifest, multi-file reads | Done |
+| Startup cleanup, lock file | Done |
 | Compaction, range scan, workload runner, analysis | Planned (second half) |
 
 `flush()` and `compact()` currently raise `NotImplementedError`.
