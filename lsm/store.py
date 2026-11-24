@@ -1,23 +1,38 @@
-"""LSMStore - Step A: memtable + WAL (no SSTables yet).
+"""LSMStore - Step B: memtable + WAL + SSTable flush + manifest + multi-file reads.
 
 Write path (rule 1): validate -> append to WAL (flush, fsync if sync=True)
--> THEN update the memtable. If the WAL append raises, the memtable is never
-touched and the sequence number is not consumed.
+-> update memtable -> auto-flush if memtable reaches ``memtable_limit``.
+
+Flush path (rule 2): write sorted SSTable (temp + fsync + replace) ->
+update manifest (temp + fsync + replace) -> truncate WAL -> clear memtable.
+
+Read path (rule 3): check memtable first, then SSTables from newest to
+oldest (skipping files via ``min_key``/``max_key``). First match wins; a
+tombstone (``None``) stops the search immediately.
 """
 from __future__ import annotations
 
 import os
-from typing import Dict, Optional, Union
+from typing import BinaryIO, Dict, List, Optional, Union
 
-from .errors import InvalidKeyError, StorageIOError
+from ._io import cleanup_temp_files
+from .errors import DatabaseLockedError, InvalidKeyError, StorageIOError
+from .manifest import Manifest
+from .sstable import SST_MISSING, SSTable, sstable_filename
 from .wal import OP_DELETE, OP_PUT, WAL_FILENAME, WriteAheadLog
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 #: Maximum key size, measured in UTF-8 bytes (not characters).
 MAX_KEY_BYTES = 1024
 
-# Distinguishes "key not in memtable" from "key is a tombstone (None)".
-# Step A's get() maps both to None, but Step B's read path must keep
-# them apart: a tombstone STOPS the search, a miss CONTINUES to SSTables.
+#: Lock file name inside the database directory.
+LOCK_FILENAME = "LOCK"
+
+# Distinguishes "key not in layer" from "key is a tombstone (None)".
 _MISSING = object()
 
 
@@ -44,41 +59,109 @@ def validate_value(value: object) -> None:
         )
 
 
-class LSMStore:
-    """Teaching-scale LSM-Tree key-value store (first half, Step A)."""
+def _acquire_dir_lock(dirpath: str) -> BinaryIO:
+    """Acquire an exclusive non-blocking lock on ``<dirpath>/LOCK``."""
+    lock_path = os.path.join(dirpath, LOCK_FILENAME)
+    try:
+        fh = open(lock_path, "a+b")
+    except OSError as exc:
+        raise StorageIOError(f"cannot open lock file {lock_path!r}: {exc}") from exc
 
-    def __init__(self, path: Union[str, "os.PathLike[str]"],
-                 memtable_limit: int = 1000, sync: bool = True) -> None:
+    try:
+        if os.name == "nt":
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        raise DatabaseLockedError(
+            f"database directory {dirpath!r} is locked by another process"
+        ) from None
+    return fh
+
+
+def _release_dir_lock(fh: Optional[BinaryIO]) -> None:
+    """Release and close the directory lock handle."""
+    if fh is None:
+        return
+    try:
+        if os.name == "nt":
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        try:
+            fh.close()
+        except OSError:
+            pass
+
+
+class LSMStore:
+    """Teaching-scale LSM-Tree key-value store (Step B)."""
+
+    def __init__(
+        self,
+        path: Union[str, "os.PathLike[str]"],
+        memtable_limit: int = 1000,
+        sync: bool = True,
+    ) -> None:
         if type(memtable_limit) is not int or memtable_limit < 1:
             raise ValueError("memtable_limit must be an int >= 1")
         if not isinstance(sync, bool):
             raise ValueError("sync must be a bool")
         self._dir = os.fspath(path)
-        self._memtable_limit = memtable_limit  # used by flush in Step B
+        self._memtable_limit = memtable_limit
         self._sync = sync
         self._closed = False
-        # Step B loads this from the manifest. Records at or below it are
-        # already inside an SSTable and must NOT be replayed.
-        self._last_flushed_seq = 0
+        self._lock_fh: Optional[BinaryIO] = None
+        self._wal: Optional[WriteAheadLog] = None
         self._memtable: Dict[str, Optional[str]] = {}
+        self._memtable_max_seq: int = 0
+        self._sstables: List[SSTable] = []  # oldest -> newest
 
         try:
             os.makedirs(self._dir, exist_ok=True)
         except OSError as exc:
             raise StorageIOError(f"cannot create {self._dir!r}: {exc}") from exc
 
-        # Recovery: read the WAL (raises CorruptFileError on mid-file damage,
-        # repairs a partial final line) and rebuild the memtable from it.
-        self._wal, records = WriteAheadLog.open_and_replay(
-            os.path.join(self._dir, WAL_FILENAME), sync=sync)
-        max_seq = 0
-        for rec in records:
-            max_seq = max(max_seq, rec.seq)
-            if rec.seq > self._last_flushed_seq:
-                # Last record for a key wins; DELETE stores a tombstone (None).
-                self._memtable[rec.key] = rec.value
-        # Sequence numbers must never be reused, even across restarts.
-        self._next_seq = max(self._last_flushed_seq, max_seq) + 1
+        self._lock_fh = _acquire_dir_lock(self._dir)
+        try:
+            # 1. Remove any stray .tmp files left behind by a mid-flush crash.
+            cleanup_temp_files(self._dir)
+
+            # 2. Load manifest and validate every live SSTable on startup.
+            self._manifest = Manifest.load_or_create(self._dir)
+            for fname in self._manifest.live_files:
+                sst = SSTable.load(os.path.join(self._dir, fname))
+                self._sstables.append(sst)
+
+            # 3. Replay WAL records newer than manifest.last_flushed_seq.
+            self._wal, records = WriteAheadLog.open_and_replay(
+                os.path.join(self._dir, WAL_FILENAME), sync=sync
+            )
+            max_seq = self._manifest.last_flushed_seq
+            for rec in records:
+                if rec.seq > max_seq:
+                    max_seq = rec.seq
+                if rec.seq > self._manifest.last_flushed_seq:
+                    self._memtable[rec.key] = rec.value
+                    self._memtable_max_seq = max(self._memtable_max_seq, rec.seq)
+
+            # Sequence numbers must never be reused, even across restarts.
+            self._next_seq = max_seq + 1
+        except Exception:
+            if self._wal is not None:
+                try:
+                    self._wal.close()
+                except Exception:
+                    pass
+            _release_dir_lock(self._lock_fh)
+            self._lock_fh = None
+            raise
 
     # ------------------------------------------------------------------ API
     def put(self, key: str, value: str) -> None:
@@ -89,11 +172,22 @@ class LSMStore:
         self._write(OP_PUT, key, value)
 
     def get(self, key: str) -> Optional[str]:
-        """Return the value for ``key``, or None if missing or deleted."""
+        """Return the newest value for ``key``, or None if missing or deleted."""
         self._ensure_open()
         validate_key(key)
+
+        # 1. Check memtable first.
         found = self._memtable_lookup(key)
-        return None if found is _MISSING else found  # type: ignore[return-value]
+        if found is not _MISSING:
+            return None if found is None else found  # type: ignore[return-value]
+
+        # 2. Search SSTables from newest to oldest.
+        for sst in reversed(self._sstables):
+            res = sst.get(key)
+            if res is not SST_MISSING:
+                return None if res is None else res  # type: ignore[return-value]
+
+        return None
 
     def delete(self, key: str) -> None:
         """Delete ``key`` by writing a tombstone. Succeeds if key is absent."""
@@ -102,19 +196,54 @@ class LSMStore:
         self._write(OP_DELETE, key, None)
 
     def flush(self) -> None:
-        """Step B: write the memtable to an SSTable."""
-        raise NotImplementedError("flush() is built in Step B")
+        """Flush the memtable to a new immutable SSTable.
+
+        No-op if the memtable is currently empty.
+        Durability order (Rule 2):
+        1. Write sorted SSTable via temp file + fsync + atomic rename.
+        2. Atomically update manifest with the new SSTable and watermark.
+        3. Truncate the WAL only AFTER the manifest is durable.
+        4. Clear the in-memory memtable.
+        """
+        self._ensure_open()
+        if not self._memtable:
+            return
+        assert self._wal is not None
+
+        file_id = self._manifest.next_file_id
+        sst = SSTable.write(
+            self._dir, file_id=file_id, items=self._memtable, sync=self._sync
+        )
+
+        self._manifest.live_files.append(sstable_filename(file_id))
+        self._manifest.next_file_id = file_id + 1
+        self._manifest.last_flushed_seq = max(
+            self._manifest.last_flushed_seq, self._memtable_max_seq
+        )
+        self._manifest.save(sync=self._sync)
+
+        # Safe to truncate WAL now that SSTable and manifest are on disk.
+        self._wal.truncate()
+
+        self._sstables.append(sst)
+        self._memtable.clear()
+        self._memtable_max_seq = 0
 
     def compact(self) -> None:
         """Second half of the project: merge SSTables. API placeholder."""
         raise NotImplementedError("compact() is planned for the second half")
 
     def close(self) -> None:
-        """Close the store. Idempotent. Unflushed data stays safe in the WAL."""
+        """Close the WAL and release the directory lock. Idempotent."""
         if self._closed:
             return
         self._closed = True
-        self._wal.close()
+        try:
+            if self._wal is not None:
+                self._wal.close()
+        finally:
+            _release_dir_lock(self._lock_fh)
+            self._lock_fh = None
 
     def __enter__(self) -> "LSMStore":
         return self
@@ -132,6 +261,7 @@ class LSMStore:
         return self._memtable.get(key, _MISSING)
 
     def _write(self, op: str, key: str, value: Optional[str]) -> None:
+        assert self._wal is not None
         seq = self._next_seq
         # DURABILITY ORDER: WAL first. If this raises StorageIOError we exit
         # here: memtable unchanged, seq not consumed, WAL rolled back.
@@ -139,4 +269,7 @@ class LSMStore:
         self._next_seq = seq + 1
         # Only now is the write acknowledged, so only now is it visible.
         self._memtable[key] = value
-        # Step B: if len(self._memtable) >= self._memtable_limit: self.flush()
+        self._memtable_max_seq = seq
+
+        if len(self._memtable) >= self._memtable_limit:
+            self.flush()
