@@ -1,16 +1,19 @@
 """Exception types for the LSM store.
 
-Each exception derives directly from ``Exception`` to keep Step A minimal.
-(A shared ``LSMError`` base class would let callers write one ``except``
-clause for everything; that is a possible addition if you want it.)
+All domain exceptions inherit from :class:`LSMError` so callers can either
+catch specific errors or handle any storage-engine failure with one clause.
 """
 
 
-class InvalidKeyError(Exception):
+class LSMError(Exception):
+    """Base class for all LSM-Tree storage engine errors."""
+
+
+class InvalidKeyError(LSMError):
     """A key is not a non-empty string within the documented size limit."""
 
 
-class CorruptFileError(Exception):
+class CorruptFileError(LSMError):
     """A WAL, SSTable or manifest file is damaged.
 
     ``filename`` is the base name of the offending file so callers (and
@@ -23,13 +26,13 @@ class CorruptFileError(Exception):
         super().__init__(f"{filename}: {reason}")
 
 
-class DatabaseLockedError(Exception):
-    """Another LSMStore already has this directory open (used from Step B)."""
+class DatabaseLockedError(LSMError):
+    """Another LSMStore already has this directory open."""
 
 
-class StorageIOError(Exception):
+class StorageIOError(LSMError):
     """An OS-level I/O operation failed (write, fsync, rename, ...)."""
 
 
-class WorkloadFormatError(Exception):
+class WorkloadFormatError(LSMError):
     """A workload file is malformed (defined now, used in the second half)."""

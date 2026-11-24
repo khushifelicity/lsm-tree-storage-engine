@@ -3,6 +3,7 @@ from .errors import (
     CorruptFileError,
     DatabaseLockedError,
     InvalidKeyError,
+    LSMError,
     StorageIOError,
     WorkloadFormatError,
 )
@@ -10,6 +11,7 @@ from .store import LSMStore
 
 __all__ = [
     "LSMStore",
+    "LSMError",
     "InvalidKeyError",
     "CorruptFileError",
     "DatabaseLockedError",

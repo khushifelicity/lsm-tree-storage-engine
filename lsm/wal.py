@@ -23,6 +23,7 @@ import json
 import os
 from typing import BinaryIO, List, NamedTuple, Optional, Tuple
 
+from ._io import fsync_dir
 from .errors import CorruptFileError, StorageIOError
 
 WAL_FILENAME = "wal.log"
@@ -39,26 +40,6 @@ class WalRecord(NamedTuple):
     op: str
     key: str
     value: Optional[str]
-
-
-def fsync_dir(dirpath: str) -> None:
-    """fsync a directory so a newly created/renamed entry survives a crash.
-
-    Creating a file only modifies the *directory*; without this, a power
-    loss can leave the file's data durable but its name missing. POSIX only:
-    Windows cannot open directories this way, so we skip it there.
-    (Step B will reuse this for SSTable and manifest renames.)
-    """
-    if os.name == "nt":
-        return
-    try:
-        fd = os.open(dirpath, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except OSError as exc:
-        raise StorageIOError(f"cannot fsync directory {dirpath!r}: {exc}") from exc
 
 
 def encode_record(seq: int, op: str, key: str, value: Optional[str]) -> bytes:
