@@ -205,6 +205,27 @@ class WriteAheadLog:
             raise StorageIOError(f"WAL append failed: {exc}") from exc
         self._size += len(data)
 
+    def truncate(self) -> None:
+        """Reset the WAL to empty after its records are durable in an SSTable.
+
+        Called ONLY after both the new SSTable and the updated manifest have
+        been atomically committed to disk.
+        """
+        if self._closed:
+            raise ValueError("WAL is closed")
+        if self._broken:
+            raise StorageIOError("WAL is in a failed state; reopen the store")
+        try:
+            os.ftruncate(self._f.fileno(), 0)
+            os.lseek(self._f.fileno(), 0, os.SEEK_SET)
+            self._f.flush()
+            if self._sync:
+                os.fsync(self._f.fileno())
+        except OSError as exc:
+            self._broken = True
+            raise StorageIOError(f"WAL truncate failed: {exc}") from exc
+        self._size = 0
+
     def _rollback(self) -> None:
         try:
             os.ftruncate(self._f.fileno(), self._size)
